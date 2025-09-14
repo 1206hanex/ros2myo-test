@@ -12,11 +12,10 @@ from ament_index_python.packages import get_package_share_directory
 from myo_msgs.msg import MyoMsg
 from myo_msgs.srv import AddGesture, TrainModel
 
-# Optional: scikit-learn for RF
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report
+from myo_classifier.train.data import load_feature_csvs, load_raw_sequences
+from myo_classifier.train.rf import train_rf
+from myo_classifier.train.cnn_lstm import train_cnn_lstm
+
 
 class Manager(Node):
     def __init__(self):
@@ -168,47 +167,30 @@ class Manager(Node):
         return resp
 
     # ---------------------------
-    # Service: TrainModel  (RF baseline)
+    # Service: TrainModel
     # ---------------------------
     def _srv_train_model(self, req: TrainModel.Request, resp: TrainModel.Response):
         self.get_logger().info(f"TrainModel: type={req.model_type} data_dir={req.data_dir}")
         try:
             os.makedirs(req.out_dir, exist_ok=True)
-            if req.model_type.lower() not in ('rf',):  # extend later
-                resp.success = False
-                resp.message = "Only 'rf' is implemented in this service example"
-                return resp
+            
+            model_type = model_type.lower().strip()
 
-            # Load all feature CSVs (non-raw) under data_dir
-            X, y = self._load_feature_csvs(req.data_dir)
-            if len(X) == 0:
-                resp.success = False; resp.message = "No feature rows found"; return resp
-
-            # Encode labels
-            le = LabelEncoder()
-            y_enc = le.fit_transform(y)
-
-            # Train RF
-            X_train, X_val, y_train, y_val = train_test_split(X, y_enc, test_size=0.2, random_state=42)
-            clf = RandomForestClassifier(n_estimators=150, random_state=42)
-            clf.fit(X_train, y_train)
-
-            # Evaluate (prints to log)
-            y_pred = clf.predict(X_val)
-            report = classification_report(y_val, y_pred, target_names=list(le.classes_))
-            self.get_logger().info("\n" + report)
-
-            # Save artifacts
-            model_path = os.path.join(req.out_dir, "gesture_classifier.pkl")
-            le_path    = os.path.join(req.out_dir, "label_encoder.pkl")
-            with open(model_path, 'wb') as f: pickle.dump(clf, f)
-            with open(le_path, 'wb') as f: pickle.dump(le, f)
-
-            resp.success = True
-            resp.message = f"Model saved to {model_path}"
-            resp.model_path = model_path
-            self.get_logger().info(resp.message)
-            return resp
+            if model_type == "rf":
+                X, y = load_feature_csvs(req.data_dir)
+                if X.size == 0:
+                    resp.success = False; resp.message = "No feature rows found."; return resp
+                model_path, _ = train_rf(X, y, req.out_dir, logger=self.get_logger().info)
+            elif model_type == "cnn_lstm":
+                # hyperparams could be declared as ROS params if you want
+                X, y = load_raw_sequences(req.data_dir, self.expect_emg_channels, seq_len=64, seq_stride=16)
+                if X.shape[0] == 0:
+                    resp.success = False; resp.message = "No raw sequences found."; return resp
+                model_path = train_cnn_lstm(X, y, req.out_dir, logger=self.get_logger().info)
+            else:
+                resp.success = False; resp.message = "model_type must be 'rf' or 'cnn_lstm'"; return resp
+            
+            
         except Exception as e:
             resp.success = False
             resp.message = f"Training failed: {e}"
