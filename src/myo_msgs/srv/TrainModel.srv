@@ -1,0 +1,12 @@
+# Request
+string model_type        # "rf" | "svm" | "knn" | "cnn_lstm" (implement the ones you want now)
+string data_dir          # directory containing CSVs from AddGesture (all gestures)
+int32 window_size        # for feature models (ignored by cnn_lstm here)
+bool  use_imu            # if your CSVs also include IMU features/raw
+string out_dir           # where to place artifacts (models/current/ is a nice convention)
+
+---
+# Response
+bool success
+string message
+string model_path        # main artifact path, e.g., gesture_classifier.pkl or gesture_cnn_lstm.h5

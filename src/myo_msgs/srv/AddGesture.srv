@@ -1,0 +1,14 @@
+# Request
+string gesture           # e.g., "thumbs_up"
+int32 seconds            # seconds per cycle (recording duration)
+int32 cycles             # how many repetitions
+int32 window_size        # sliding window size (samples) for feature extraction
+bool  raw_mode           # false = save feature rows; true = save raw per-sample rows
+string out_dir           # directory to write CSVs (will be created if missing)
+int32 countdown_sec      # optional countdown before each cycle (e.g., 3)
+
+---
+# Response
+bool success
+string message
+string csv_path          # path of the last CSV written (for convenience)
