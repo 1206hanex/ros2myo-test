@@ -47,8 +47,8 @@ class Manager(Node):
         self.sub = self.create_subscription(MyoMsg, 'myo/data', self._on_myo, 50)
 
         # Services
-        self.srv_add = self.create_service(AddGesture, 'myo_gestures/add_gesture', self._srv_add_gesture)
-        self.srv_train = self.create_service(TrainModel, 'myo_gestures/train_model', self._srv_train_model)
+        self.srv_add = self.create_service(AddGesture, 'myo_classifier/add_gesture', self._srv_add_gesture)
+        self.srv_train = self.create_service(TrainModel, 'myo_classifier/train_model', self._srv_train_model)
 
         self.get_logger().info('Manager ready: services {add_gesture, train_model}')
 
