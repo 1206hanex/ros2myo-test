@@ -9,6 +9,12 @@ myo_stream:
     uuid_imu: "d5060104-a904-deb9-4748-2c7f4a124842"
     enable_cmd: [1,3,2,1,1,0,0]
 
+manager:
+  ros__parameters:
+    expect_emg_channels: 8
+    include_imu: false   # set true once IMU is present
+    feature_stride_sec: 0.20
+
 myo_rf:
   ros__parameters:
     window_size: 20

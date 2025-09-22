@@ -16,6 +16,8 @@ from myo_classifier.train.data import load_feature_csvs, load_raw_sequences
 from myo_classifier.train.rf import train_rf
 from myo_classifier.train.cnn_lstm import train_cnn_lstm
 
+from myo_classifier.common.feature_extraction import feature_columns, make_feature_row
+
 
 class Manager(Node):
     def __init__(self):
@@ -58,28 +60,39 @@ class Manager(Node):
         if len(msg.emg_data) != self.expect_emg_channels:
             return
 
-        # Store latest sample
+        # EMG
         sample = [float(v) for v in msg.emg_data]
         self._emg_buf.append(sample)
 
-        # If not actively collecting, nothing else to do
+        # IMU (when your publisher starts sending it)
+        if msg.imu_data and len(msg.imu_data) >= 10:
+            # assume imu_data already scaled to floats; if ints, scale in publisher or here
+            imu_sample = [float(v) for v in msg.imu_data[:10]]
+            self._imu_buf.append(imu_sample)
+
         if not self._collect_active:
             return
 
         now = time.monotonic()
-
         if self._collect_mode_raw:
-            # Save raw per-sample rows: emg_0..emg_7,label
-            row = sample + [self._collect_label]
+            # RAW: write per-sample rows. Add IMU if available for that tick.
+            row = sample.copy()
+            # Optional IMU concatenation:
+            if msg.imu_data and len(msg.imu_data) >= 10:
+                row += imu_sample
+            row += [self._collect_label]
             self._raw_rows.append(row)
         else:
-            # Feature mode: sample a window every stride
-            if len(self._emg_buf) >= self._collect_window:
+            # FEATURES: require a full EMG window; if include_imu=True, also require full IMU window
+            if len(self._emg_buf) >= self._collect_window and \
+            (not self.include_imu or len(self._imu_buf) >= self._collect_window):
                 if (now - self._last_feature_emit) >= self.feature_stride_sec:
-                    window = np.array(list(self._emg_buf)[-self._collect_window:], dtype=np.float32)
-                    feats = self._features_from_window(window)   # len = 8*3
-                    row = feats + [self._collect_label]
-                    self._feature_rows.append(row)
+                    emg_win = np.array(list(self._emg_buf)[-self._collect_window:], dtype=np.float32)
+                    imu_win = None
+                    if self.include_imu and len(self._imu_buf) >= self._collect_window:
+                        imu_win = np.array(list(self._imu_buf)[-self._collect_window:], dtype=np.float32)
+                    feats = make_feature_row(emg_win, imu_win, self._collect_label)
+                    self._feature_rows.append(feats)
                     self._last_feature_emit = now
 
     @staticmethod
@@ -140,17 +153,16 @@ class Manager(Node):
         # Write CSV
         try:
             if req.raw_mode:
-                # Header: emg_0..emg_7,label
-                header = [f"emg_{i}" for i in range(self.expect_emg_channels)] + ["label"]
+                # Raw headers: emg_0.., optionally imu_* if present
+                header = [f"emg_{i}" for i in range(self.expect_emg_channels)]
+                # If you want IMU columns in raw CSVs unconditionally, add them:
+                header += ["quat_w","quat_x","quat_y","quat_z","accel_x","accel_y","accel_z","gyro_x","gyro_y","gyro_z"]
+                header += ["label"]
                 rows = self._raw_rows
             else:
-                # Header: emg_rms_0..7, emg_mean_0..7, emg_var_0..7, label
-                header = \
-                    [f"emg_rms_{i}"  for i in range(self.expect_emg_channels)] + \
-                    [f"emg_mean_{i}" for i in range(self.expect_emg_channels)] + \
-                    [f"emg_var_{i}"  for i in range(self.expect_emg_channels)] + \
-                    ["label"]
-                rows = self._feature_rows
+                # Feature columns depend on include_imu flag
+                header = feature_columns(emg_ch=self.expect_emg_channels, include_imu=self.include_imu)
+                rows = self._feature_row
 
             with open(csv_path, 'w', newline='') as f:
                 writer = csv.writer(f)
