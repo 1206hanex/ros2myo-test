@@ -32,6 +32,9 @@ setup(
             'myo_rf     = myo_classifier.myo_rf:main',
             'myo_cnn    = myo_classifier.myo_cnn:main',
             'manager = myo_classifier.manager:main',
+            'game_rf     = myo_classifier.games.game_rf:main',
+            'game_cnn_lstm    = myo_classifier.games.game_cnn_lstm:main',
+            'game_svm     = myo_classifier.games.game_svm:main',
         ],
     },
 )
