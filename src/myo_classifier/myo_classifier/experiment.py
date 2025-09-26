@@ -44,6 +44,7 @@ REP_TOTAL = PHASE_IDLE + PHASE_RAMP + PHASE_HOLD + PHASE_RELAX  # 11.5s
 MYO_MAC = "EC:6D:69:B3:F8:73"
 
 UUID_CONTROL   = "d5060401-a904-deb9-4748-2c7f4a124842"  # enable streaming cmd
+IMU_UUID = "d5060402-a904-deb9-4748-2c7f4a124842"
 UUID_IMU_DATA  = "d5060104-a904-deb9-4748-2c7f4a124842"  # IMU notify
 UUID_EMG_DATA  = "d5060105-a904-deb9-4748-2c7f4a124842"  # EMG notify (one of them)
 UUID_EMG_STREAMS = [
@@ -75,6 +76,10 @@ MANIFEST_HEADER = [
     "gesture_id","gesture_name","rep_idx",
     "raw_path","samples_hz","notes"
 ]
+
+MIN_SAMPLES_FRACTION = 0.40   # accept >= 40% of nominal length
+NOMINAL_SAMPLES = int(REP_TOTAL * SAMPLE_RATE_HZ)   # e.g., 11.5 * 200 = 2300
+MIN_SAMPLES = int(NOMINAL_SAMPLES * MIN_SAMPLES_FRACTION)  # ~920
 
 @dataclass
 class ManifestRow:
@@ -114,36 +119,36 @@ def on_emg_notify(_sender: str, data: bytes):
     if not recording_active or current_trial_rows is None:
         return
 
-    # Parse 16 signed chars -> take first 8 as 8 channels
-    if len(data) == 16:
-        emg_vals = struct.unpack("16b", data)
-        ch = emg_vals[:8]
-    else:
-        # Unknown packet; ignore
+    if len(data) != 16:
         return
 
-    ts_ns = time.time_ns()
+    # 16 signed bytes = two frames of 8 channels
+    emg_vals = struct.unpack("16b", data)
+    frame1 = emg_vals[:8]
+    frame2 = emg_vals[8:]
 
-    # Pull latest IMU snapshot if available; else fill with blanks
+    ts1 = time.time_ns()
+    # approximate 1/sample_rate spacing for the second frame
+    delta_ns = int(1e9 / SAMPLE_RATE_HZ)
+    ts2 = ts1 + delta_ns
+
     if latest_imu is not None:
         ax, ay, az, gx, gy, gz, qw, qx, qy, qz = latest_imu
     else:
         ax = ay = az = gx = gy = gz = qw = qx = qy = qz = ""
 
-    row = [
-        ts_ns,
+    meta = (
         current_meta.get("subject_id",""),
         current_meta.get("run_idx",""),
         current_meta.get("gesture_id",""),
         current_meta.get("gesture_name",""),
         current_meta.get("rep_idx",""),
         current_phase,
-        *ch,
-        ax, ay, az,
-        gx, gy, gz,
-        qw, qx, qy, qz,
-    ]
-    current_trial_rows.append(row)
+    )
+
+    # row(ts, meta..., emg8, imu10)
+    current_trial_rows.append([ts1, *meta, *frame1, ax, ay, az, gx, gy, gz, qw, qx, qy, qz])
+    current_trial_rows.append([ts2, *meta, *frame2, ax, ay, az, gx, gy, gz, qw, qx, qy, qz])
 
 def on_imu_notify(_sender: str, data: bytes):
     """
@@ -211,6 +216,17 @@ async def record_single_repetition(gesture_id: str, rep_idx: int, run_idx: int, 
         await asyncio.sleep(0.01)
 
     recording_active = False
+
+    # check if band is disconnected
+    sample_count = len(current_trial_rows)
+    if sample_count < MIN_SAMPLES:
+        print(f"✗ Too few samples ({sample_count} < {MIN_SAMPLES}). Likely a drop/disconnect.")
+        print("Retrying the SAME repetition; the file will be overwritten.\n")
+        # reset state and retry recursively
+        current_trial_rows = None
+        current_meta = {}
+        current_phase = "idle"
+        return await record_single_repetition(gesture_id, rep_idx, run_idx, run_dir)
 
     # Write CSV to disk
     with open(raw_abs_path, "w", newline="") as f:
@@ -299,6 +315,7 @@ async def connect_and_collect():
         # Subscriptions
         # For EMG, subscribe to ONE stream to avoid duplicate/burst rows
         await client.start_notify(UUID_EMG_STREAMS[0], on_emg_notify)
+        await client.start_notify(UUID_EMG_STREAMS[1], on_emg_notify)
         # If you find you need the second stream for stability, you can also subscribe to it.
         # await client.start_notify(UUID_EMG_STREAMS[1], on_emg_notify)
 
