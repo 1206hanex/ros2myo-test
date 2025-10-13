@@ -21,7 +21,7 @@ class MyoEMGPublisher(Node):
         self.declare_parameter('uuid_control', 'd5060401-a904-deb9-4748-2c7f4a124842')
         self.declare_parameter('uuid_emg_streams', ['d5060105-a904-deb9-4748-2c7f4a124842',
                                                     'd5060405-a904-deb9-4748-2c7f4a124842',])
-        self.declare_parameter('uuid_imu', 'd5060104-a904-deb9-4748-2c7f4a124842')
+        self.declare_parameter('uuid_imu', 'd5060402-a904-deb9-4748-2c7f4a124842')
         self.declare_parameter('enable_cmd', [1, 3, 2, 1, 1, 0, 0])
 
         self.device_id        = self.get_parameter('device_id').value
@@ -41,8 +41,8 @@ class MyoEMGPublisher(Node):
 
         self.pub = self.create_publisher(MyoMsg, 'myo/data', 10)
         
-        self.last_emg_frame = None
-        self.last_emg_time = None
+        self._last_emg_frame = None
+        self._last_emg_time = None
 
         # Async BLE task
         #self._stop = False
@@ -63,10 +63,12 @@ class MyoEMGPublisher(Node):
                     await client.write_gatt_char(self.UUID_CONTROL, self.ENABLE_CMD)
                     for uuid in self.UUID_EMG_STREAMS:
                         await client.start_notify(uuid, self.emg_callback)
+                        self.get_logger().info(f'EMG notify successful!')
                         
                     if self.UUID_IMU:
                         try:
                             await client.start_notify(self.UUID_IMU, self.imu_callback)
+                            self.get_logger().info(f'IMU notify successful!')
                         except Exception as e:
                             self.get_logger().warn(f'IMU notify failed (continuing EMG-only): {e}')
 
@@ -89,8 +91,8 @@ class MyoEMGPublisher(Node):
             frame = [float(v) for v in vals[offset:offset+8]]
             
             # remember latest EMG for IMU merge
-            self.last_emg_frame = frame
-            self.last_emg_time  = self.get_clock().now()
+            self._last_emg_frame = frame
+            self._last_emg_time  = self.get_clock().now()
             
             msg = MyoMsg()
             msg.stamp = self.get_clock().now().to_msg()
@@ -142,7 +144,7 @@ class MyoEMGPublisher(Node):
         merged_emg = []
         if self._last_emg_frame is not None and self._last_emg_time is not None:
             now = self.get_clock().now()
-            age = (now.nanoseconds - self._last_emg_time.nanoseconds) / 1e9
+            age = (now.nanoseconds - self.last_emg_time.nanoseconds) / 1e9
             if age <= 0.05:
                 merged_emg = list(self._last_emg_frame)
 
@@ -158,14 +160,6 @@ class MyoEMGPublisher(Node):
         msg.imu_channels = self.imu_channels
 
         self.pub.publish(msg)
-
-    def destroy_node(self):
-        self._stop = True
-        try:
-            self.ble_task.cancel()
-        except Exception:
-            pass
-        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)

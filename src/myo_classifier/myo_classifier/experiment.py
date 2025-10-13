@@ -11,10 +11,10 @@ import numpy as np
 from bleak import BleakClient
 
 # ======== USER SETUP ========
-SUBJECT_ID = "S01"
+SUBJECT_ID = "S05"
 BASE_DIR = "data"                     # root data folder
 RUN_COUNT = 5                         # k-fold by runs
-REPS_PER_GESTURE = 5                  # 5 reps per gesture per run
+REPS_PER_GESTURE = 3                  # 3 reps per gesture per run
 SAMPLE_RATE_HZ = 200                  # nominal Myo EMG rate
 
 # Gesture map & order (you can change the block order per run if you like)
@@ -44,8 +44,7 @@ REP_TOTAL = PHASE_IDLE + PHASE_RAMP + PHASE_HOLD + PHASE_RELAX  # 11.5s
 MYO_MAC = "EC:6D:69:B3:F8:73"
 
 UUID_CONTROL   = "d5060401-a904-deb9-4748-2c7f4a124842"  # enable streaming cmd
-IMU_UUID = "d5060402-a904-deb9-4748-2c7f4a124842"
-UUID_IMU_DATA  = "d5060104-a904-deb9-4748-2c7f4a124842"  # IMU notify
+UUID_IMU_DATA  = "d5060402-a904-deb9-4748-2c7f4a124842"  # IMU notify
 UUID_EMG_DATA  = "d5060105-a904-deb9-4748-2c7f4a124842"  # EMG notify (one of them)
 UUID_EMG_STREAMS = [
     "d5060105-a904-deb9-4748-2c7f4a124842",
