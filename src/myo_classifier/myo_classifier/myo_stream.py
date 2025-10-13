@@ -144,7 +144,7 @@ class MyoEMGPublisher(Node):
         merged_emg = []
         if self._last_emg_frame is not None and self._last_emg_time is not None:
             now = self.get_clock().now()
-            age = (now.nanoseconds - self.last_emg_time.nanoseconds) / 1e9
+            age = (now.nanoseconds - self._last_emg_time.nanoseconds) / 1e9
             if age <= 0.05:
                 merged_emg = list(self._last_emg_frame)
 
