@@ -32,7 +32,7 @@ class Manager(Node):
         self.model_modules = {
             'rf': 'myo_classifier.train.rf',
             'svm': 'myo_classifier.train.svm',
-            'cnn_lstm': 'myo_classifier.train.cnn_lstm',
+            'cnn_lstm': None,
         }
 
         # Optional: map model keys -> script path (used if import fails)
@@ -40,7 +40,7 @@ class Manager(Node):
         self.model_scripts = {
             'rf': None,         # e.g., '/home/hanex/ros2_ws/src/myo_classifier/scripts/train_rf.py'
             'svm': None,
-            'cnn_lstm': None,
+            'cnn_lstm': '/home/hanex/ros2myo-test/src/myo_classifier/myo_classifier/train/cnn_lstm_cli.py',
         }
 
         # Reentrant group for services
@@ -247,7 +247,11 @@ class Manager(Node):
             cmd += ['--overwrite']
 
         self.get_logger().info(f'Running: {" ".join(cmd)}')
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        env = dict(os.environ)
+        env.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+        env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if proc.returncode != 0:
             raise RuntimeError(f'Training script failed ({proc.returncode}): {proc.stderr.strip()}')
 

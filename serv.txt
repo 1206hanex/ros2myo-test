@@ -1,0 +1,5 @@
+ros2 service call /myo_classifier/train_model myo_msgs/srv/TrainModel "{model: rf, data_dir: '~/myo_data', out_dir: '~/runs', epochs: 50, save_model: true}"
+
+ros2 service call /myo_classifier/train_model myo_msgs/srv/TrainModel "{model: svm, data_dir: '~/myo_data', out_dir: '~/runs', epochs: 50, save_model: true}"
+
+ros2 service call /myo_classifier/train_model myo_msgs/srv/TrainModel "{model: cnn_lstm, data_dir: '~/myo_data', out_dir: '~/runs', epochs: 50}"
