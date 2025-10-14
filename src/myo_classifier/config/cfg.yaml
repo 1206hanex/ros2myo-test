@@ -11,8 +11,8 @@ myo_stream:
 
 gesture_recorder:
   ros__parameters:
-    default_seconds: 5
-    default_cycles: 2
+    default_seconds: 8
+    default_cycles: 3
     default_window_size: 200
     default_raw_mode: false
     default_out_dir: "myo_data"

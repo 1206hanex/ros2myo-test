@@ -31,6 +31,7 @@ setup(
             'myo_stream = myo_classifier.myo_stream:main',
             'myo_rf     = myo_classifier.myo_rf:main',
             'myo_cnn    = myo_classifier.myo_cnn:main',
+            'myo_svm    = myo_classifier.myo_svm:main',
             'manager = myo_classifier.manager:main',
             'gesture_recorder = myo_classifier.gesture_recorder:main',
             'game_rf     = myo_classifier.games.game_rf:main',
