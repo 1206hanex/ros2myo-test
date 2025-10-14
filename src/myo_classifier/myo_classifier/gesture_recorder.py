@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, time, csv, threading
+import os, time, csv, threading, sys
 from datetime import datetime
 from collections import deque
 
@@ -28,6 +28,8 @@ class GestureRecorder(Node):
         self.declare_parameter('feature_stride_sec', 0.20)   # ~5 Hz feature emission
         self.declare_parameter('auto_exit', False)           # shutdown after done
 
+        self.declare_parameter('prompt_enter', True)
+
         # Normalize params
         _g = self.get_parameter('gestures').value
         if isinstance(_g, (list, tuple)):
@@ -44,6 +46,7 @@ class GestureRecorder(Node):
         self.C             = int(self.get_parameter('expect_emg_channels').value)
         self.feature_stride_sec = float(self.get_parameter('feature_stride_sec').value)
         self.auto_exit     = bool(self.get_parameter('auto_exit').value)
+        self.prompt_enter  = bool(self.get_parameter('prompt_enter').value)
 
         os.makedirs(self.out_dir, exist_ok=True)
 
@@ -84,7 +87,7 @@ class GestureRecorder(Node):
 
         self.get_logger().info(
             f'GestureRecorder ready. gestures={self.gestures} cycles={self.cycles} seconds={self.seconds} '
-            f'raw_mode={self.raw_mode} window={self.window_size} out="{self.csv_path}"'
+            f'raw_mode={self.raw_mode} window={self.window_size} out="{self.csv_path}" prompt_enter={self.prompt_enter}'
         )
 
     # ---------- utils ----------
@@ -104,6 +107,21 @@ class GestureRecorder(Node):
                              [f'emg_var_{i+1}' for i in range(self.C)])
                 header = ['t_mid','label'] + feat_cols + imu_cols
             w.writerow(header)
+
+    def _wait_for_enter(self, g: str, rep: int):
+        if not self.prompt_enter:
+            return
+        try:
+            if hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+                # use print/input instead of logger so the prompt appears cleanly
+                print(f'\n[Ready] Prepare gesture "{g}" rep {rep}/{self.cycles}. '
+                      f'Press ENTER to start recording...', flush=True)
+                input()
+            else:
+                self.get_logger().warn('stdin is not a TTY; proceeding without Enter prompt.')
+        except Exception as e:
+            self.get_logger().warn(f'Enter prompt failed ({e}); proceeding without waiting.')
+
 
     # ---------- subscriber ----------
     def _on_myo(self, msg: MyoMsg):
@@ -171,6 +189,7 @@ class GestureRecorder(Node):
         try:
             for g in self.gestures:
                 for rep in range(1, self.cycles + 1):
+                    self._wait_for_enter(g, rep)
                     # countdown
                     if self.countdown_sec > 0:
                         for k in range(self.countdown_sec, 0, -1):

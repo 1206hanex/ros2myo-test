@@ -35,6 +35,7 @@ def generate_launch_description():
         executable='gesture_recorder',
         name='gesture_recorder',
         output='screen',
+        emulate_tty=True,
         parameters=[params_file],
     )
     start_recorder_when_myo_starts = RegisterEventHandler(
