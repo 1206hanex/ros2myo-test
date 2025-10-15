@@ -1,191 +1,403 @@
 #!/usr/bin/env python3
+import os, json, pickle, time, shutil, subprocess
+from pathlib import Path
+from collections import deque, Counter
+
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
+from myo_msgs.msg import MyoMsg
+from std_msgs.msg import String
 
-import os, time, pickle
-import numpy as np
-from collections import deque
-from ament_index_python.packages import get_package_share_directory
+# --------- Training-matched feature helpers ---------
+def _waveform_length(x: np.ndarray) -> float:
+    return float(np.sum(np.abs(np.diff(x))))
 
-# ---- Keyboard control (pynput) ----
-try:
-    from pynput.keyboard import Controller, Key
-    _KEYBOARD = Controller()
-    _KEY_SUPPORT = True
-except Exception as e:
-    _KEYBOARD = None
-    _KEY_SUPPORT = False
-    _KEY_IMPORT_ERROR = e
+def _zero_crossings(x: np.ndarray, thresh: float) -> int:
+    if x.ndim != 1:
+        x = np.ravel(x)
+    s = np.sign(x)
+    ds = np.diff(s)
+    amp_jump = np.abs(np.diff(x))
+    return int(np.sum((ds != 0) & (amp_jump > thresh)))
 
-# -----------------------
-# Parameters / constants
-# -----------------------
-window_size = 20  # Must match training (number of time steps per window)
-NUM_CHANNELS = 8
-
-# Label map must match your training labels
-gesture_labels = {
-    0: "rest",
-    1: "pinch",
-    2: "fist",
-    3: "extension",
-    4: "left",
-    5: "right",
-}
-
-PKG_NAME = "myo_space_trigger"
-# Preferred: a single Pipeline (StandardScaler -> SVM)
-PIPELINE_FNAME = "gesture_svm_pipeline.pkl"
-# Fallback: separate scaler + model
-SCALER_FNAME = "gesture_scaler.pkl"
-MODEL_FNAME = "gesture_svm.pkl"
+def _slope_sign_changes(x: np.ndarray, thresh: float) -> int:
+    if x.ndim != 1:
+        x = np.ravel(x)
+    dx1 = np.diff(x)
+    sign_change = (dx1[:-1] * dx1[1:]) < 0
+    big_enough  = (np.abs(dx1[:-1]) > thresh) | (np.abs(dx1[1:]) > thresh)
+    return int(np.sum(sign_change & big_enough))
 
 
-class EMG_SVM_Node(Node):
+# --------- Key sender (pynput → xdotool → none) ---------
+class KeySender:
+    """
+    send('enter'|'space'|'left'|'right') using:
+    - pynput (preferred)
+    - xdotool (fallback)
+    - none (logs a warning)
+    """
+    def __init__(self, logger):
+        self.logger = logger
+        self.mode = 'none'
+        self._kbd = None
+        try:
+            from pynput.keyboard import Controller, Key
+            self._kbd = Controller()
+            self._Key = Key
+            self.mode = 'pynput'
+            self.logger.info('KeySender: using pynput')
+        except Exception:
+            if shutil.which('xdotool'):
+                self.mode = 'xdotool'
+                self.logger.info('KeySender: using xdotool')
+            else:
+                self.logger.warn('KeySender: no pynput or xdotool found; keypresses disabled.')
+
+    def send(self, canonical_name: str) -> bool:
+        name = canonical_name.lower()
+        if self.mode == 'pynput':
+            key_map = {
+                'enter': self._Key.enter,
+                'space': self._Key.space,
+                'left' : self._Key.left,
+                'right': self._Key.right,
+            }
+            key = key_map.get(name)
+            if key is None:
+                return False
+            try:
+                self._kbd.press(key)
+                self._kbd.release(key)
+                return True
+            except Exception:
+                return False
+
+        if self.mode == 'xdotool':
+            x_map = {
+                'enter': 'Return',
+                'space': 'space',
+                'left' : 'Left',
+                'right': 'Right',
+            }
+            xk = x_map.get(name)
+            if xk is None:
+                return False
+            try:
+                subprocess.run(['xdotool', 'key', xk], check=False)
+                return True
+            except Exception:
+                return False
+
+        return False
+
+
+class EMGClassifierSVM(Node):
     def __init__(self):
-        super().__init__("myo_svm")
+        super().__init__('myo_svm')
 
-        # Resolve paths
-        share_dir = get_package_share_directory(PKG_NAME)
-        pipeline_path = os.path.join(share_dir, PIPELINE_FNAME)
-        scaler_path = os.path.join(share_dir, SCALER_FNAME)
-        model_path = os.path.join(share_dir, MODEL_FNAME)
+        # ---------- Params ----------
+        self.declare_parameter('artifacts_dir', str(Path.home() / 'runs'))
+        self.declare_parameter('classifier_file', 'gesture_classifier.pkl')
+        self.declare_parameter('label_encoder_file', 'label_encoder.pkl')
+        # prefer SVM metadata, fall back to RF if needed
+        self.declare_parameter('metadata_file', 'svm_metadata.json')
+        self.declare_parameter('fallback_metadata_file', 'rf_metadata.json')
 
-        # Try to load a single Pipeline first; else load scaler + model
-        self.pipeline = None
+        # If <= 0, infer window from metadata: round(window_sec * sampling_rate)
+        self.declare_parameter('window_size', -1)
+
+        # Feature thresholds (ZC/SSC) override; else from metadata (defaults 0.01)
+        self.declare_parameter('zc_thresh', None)
+        self.declare_parameter('ssc_thresh', None)
+
+        # Optional scaler (recommended for SVM)
+        self.declare_parameter('scaler_file', 'scaler.pkl')
+
+        # Voting / smoothing
+        self.declare_parameter('vote_k', 5)
+
+        # Keypress behavior
+        self.declare_parameter('send_keys', True)            # enable/disable key sending
+        self.declare_parameter('min_interval_sec', 0.35)     # debounce between sends
+        self.declare_parameter('min_confidence', 0.0)        # require this prob/score (0 disables)
+        # Optional JSON to override mapping:
+        # {"fist":"enter","open_hand":"space","wrist_left":"left","wrist_right":"right"}
+        self.declare_parameter('keymap_json', '')
+
+        # ---------- Load artifacts ----------
+        adir = os.path.expanduser(self.get_parameter('artifacts_dir').value)
+        clf_path  = os.path.join(adir, self.get_parameter('classifier_file').value)
+        le_path   = os.path.join(adir, self.get_parameter('label_encoder_file').value)
+        meta_path = os.path.join(adir, self.get_parameter('metadata_file').value)
+        meta_fb   = os.path.join(adir, self.get_parameter('fallback_metadata_file').value)
+        sc_path   = os.path.join(adir, self.get_parameter('scaler_file').value)
+
+        with open(clf_path, 'rb') as f:
+            self.clf = pickle.load(f)
+        with open(le_path, 'rb') as f:
+            self.le = pickle.load(f)
+
+        # scaler is optional
         self.scaler = None
-        self.model = None
+        if os.path.exists(sc_path):
+            try:
+                with open(sc_path, 'rb') as f:
+                    self.scaler = pickle.load(f)
+                self.get_logger().info(f'Loaded scaler: {sc_path}')
+            except Exception as e:
+                self.get_logger().warn(f'Could not load scaler ({e}); continuing without.')
 
-        if os.path.exists(pipeline_path):
-            with open(pipeline_path, "rb") as f:
-                self.pipeline = pickle.load(f)
-            self.get_logger().info(f"Loaded scikit-learn Pipeline: {pipeline_path}")
-        else:
-            if not (os.path.exists(scaler_path) and os.path.exists(model_path)):
-                raise FileNotFoundError(
-                    f"Could not find {PIPELINE_FNAME} or both {SCALER_FNAME} and {MODEL_FNAME} in {share_dir}"
-                )
-            with open(scaler_path, "rb") as f:
-                self.scaler = pickle.load(f)
-            with open(model_path, "rb") as f:
-                self.model = pickle.load(f)
-            self.get_logger().info(f"Loaded scaler: {scaler_path} and SVM: {model_path}")
+        # metadata (try SVM, then RF)
+        meta = {}
+        meta_source = None
+        for candidate in (meta_path, meta_fb):
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, 'r') as f:
+                        meta = json.load(f)
+                        meta_source = candidate
+                        break
+                except Exception as e:
+                    self.get_logger().warn(f'Could not read metadata {candidate}: {e}')
+        if meta_source is None:
+            self.get_logger().warn('No metadata JSON found; using defaults.')
 
-        # Buffer and sub
-        self.emg_buffer = deque(maxlen=window_size)
-        self.subscription = self.create_subscription(
-            Float32MultiArray, "emg_raw", self.listener_callback, 10
+        sampling_rate = float(meta.get('sampling_rate', 200.0) or 200.0)
+        window_sec    = float(meta.get('window_sec', 0.2) or 0.2)
+        auto_W = int(round(sampling_rate * window_sec))
+
+        meta_zc  = float(meta.get('zc_thresh', 0.01))
+        meta_ssc = float(meta.get('ssc_thresh', 0.01))
+
+        param_W = int(self.get_parameter('window_size').value)
+        self.W = auto_W if param_W <= 0 else param_W
+
+        zc_param  = self.get_parameter('zc_thresh').value
+        ssc_param = self.get_parameter('ssc_thresh').value
+        self.zc_thresh  = float(meta_zc if zc_param in (None, '') else zc_param)
+        self.ssc_thresh = float(meta_ssc if ssc_param in (None, '') else ssc_param)
+
+        self.vote_k = int(self.get_parameter('vote_k').value)
+
+        exp = getattr(self.clf, 'n_features_in_', None)
+        self.get_logger().info(
+            f'Loaded SVM classifier: {clf_path} (expects {exp} features); '
+            f'classes={list(self.le.classes_)}'
+        )
+        self.get_logger().info(
+            f'Metadata source={meta_source} | sampling_rate={sampling_rate}, '
+            f'window_sec={window_sec} -> W={auto_W}, zc_thresh={self.zc_thresh}, '
+            f'ssc_thresh={self.ssc_thresh}; Runtime W={self.W}'
         )
 
-        # Trigger debounce/stability
-        self.cooldown_sec = 0.6
-        self.last_trigger_ts = 0.0
-        self.consecutive_required = 2
-        self._prev_pred = None
-        self._streak = 0
+        # ---------- Buffers & I/O ----------
+        self.emg_buf  = deque(maxlen=self.W)
+        self.pred_buf = deque(maxlen=self.vote_k)
+        self.sub = self.create_subscription(MyoMsg, 'myo/data', self.cb, 10)
+        self.pub_label = self.create_publisher(String, 'myo/pred', 10)
 
-        if not _KEY_SUPPORT:
+        # ---------- Key sending setup ----------
+        self.send_keys = bool(self.get_parameter('send_keys').value)
+        self.min_interval = float(self.get_parameter('min_interval_sec').value)
+        self.min_conf = float(self.get_parameter('min_confidence').value)
+        self._sender = KeySender(self.get_logger())
+        self._last_sent_label = None
+        self._last_sent_time = 0.0
+
+        # Default mapping (can be overridden with keymap_json)
+        self.gesture_to_key = {
+            'fist': 'enter',
+            'open_hand': 'space',
+            'wrist_left': 'left',
+            'wrist_right': 'right',
+        }
+        km_raw = self.get_parameter('keymap_json').value
+        if isinstance(km_raw, str) and km_raw.strip():
+            try:
+                override = json.loads(km_raw)
+                canon = {'enter', 'space', 'left', 'right'}
+                cleaned = {}
+                for k, v in override.items():
+                    vv = str(v).lower()
+                    if vv not in canon:
+                        self.get_logger().warn(f'Ignoring unknown key "{v}" for gesture "{k}"')
+                        continue
+                    cleaned[str(k)] = vv
+                self.gesture_to_key.update(cleaned)
+                self.get_logger().info(f'Custom keymap applied: {self.gesture_to_key}')
+            except Exception as e:
+                self.get_logger().warn(f'Failed to parse keymap_json: {e}')
+
+        # Warn if feature count unexpected
+        if exp is not None and exp != 72:
             self.get_logger().warn(
-                f"Keyboard control disabled (pynput import failed: {_KEY_IMPORT_ERROR}). "
-                "Predictions will log but not press keys."
+                f'SVM n_features_in_={exp} but runtime computes 72; ensure training used the same 9×8 pack.'
             )
 
-        self.get_logger().info("SVM EMG Node started → listening on /emg_raw")
+    # Exact training feature order:
+    # [MAV, WL, RMS, ZC, SSC, Mean, Median, Std, Var] × 8 channels
+    def _features_train_exact(self, Xw: np.ndarray) -> np.ndarray:
+        feats = []
+        for ch in range(Xw.shape[1]):
+            x = Xw[:, ch]
+            mav = float(np.mean(np.abs(x)))
+            wl  = _waveform_length(x)
+            rms = float(np.sqrt(np.mean(x ** 2)))
+            zc  = _zero_crossings(x, self.zc_thresh)
+            ssc = _slope_sign_changes(x, self.ssc_thresh)
+            mu  = float(np.mean(x))
+            med = float(np.median(x))
+            sd  = float(np.std(x, ddof=0))
+            var = float(np.var(x, ddof=0))
+            feats.extend([mav, wl, rms, zc, ssc, mu, med, sd, var])
+        return np.asarray(feats, dtype=float)
 
-    # --------- feature extraction (same as RF version) ----------
-    def _extract_features(self, window_TxC: np.ndarray) -> np.ndarray:
-        """
-        window_TxC: shape [T, C]
-        Returns a flat feature vector: [rms(8), mean(8), var(8)] -> 24 dims if C=8
-        """
-        # Safety: ensure correct shape
-        if window_TxC.ndim != 2 or window_TxC.shape[1] != NUM_CHANNELS:
-            raise ValueError(f"Expected window shape [T,{NUM_CHANNELS}], got {window_TxC.shape}")
+    def _predict_with_scores(self, feats: np.ndarray):
+        # optional scaler
+        if self.scaler is not None:
+            try:
+                feats = self.scaler.transform(feats)
+            except Exception as e:
+                self.get_logger().warn(f'Scaler transform failed: {e}')
+        y = self.clf.predict(feats)[0]
 
-        rms = np.sqrt(np.mean(np.square(window_TxC), axis=0))
-        mean = np.mean(window_TxC, axis=0)
-        var = np.var(window_TxC, axis=0)
-        feat = np.concatenate([rms, mean, var], axis=0).astype(np.float32)
-        return feat  # shape (24,)
+        # probabilities or decision scores
+        probs = None
+        scores = None
+        class_order = getattr(self.clf, 'classes_', None)
+        if hasattr(self.clf, 'predict_proba'):
+            try:
+                probs = self.clf.predict_proba(feats)[0]
+            except Exception:
+                probs = None
+        if probs is None and hasattr(self.clf, 'decision_function'):
+            try:
+                s = self.clf.decision_function(feats)[0]
+                if class_order is not None and np.ndim(s) == 1 and len(s) == len(class_order):
+                    # convert to a softmax-like distribution for ranking/gating (not calibrated)
+                    s = s - np.max(s)
+                    e = np.exp(s)
+                    scores = e / np.sum(e)
+                else:
+                    scores = None
+            except Exception:
+                scores = None
+        return y, probs, scores, class_order
 
-    # ---------------- keyboard helpers ----------------
-    def _press_key(self, key):
-        if not _KEY_SUPPORT:
-            return
-        try:
-            _KEYBOARD.press(key)
-            _KEYBOARD.release(key)
-        except Exception as e:
-            self.get_logger().warn(f"Failed to send keypress: {e}")
-
-    def _maybe_trigger_action(self, prediction_id: int):
-        now = time.time()
-
-        # stability requirement
-        if prediction_id == self._prev_pred:
-            self._streak += 1
+    def _topk_str(self, probs, scores, class_order, k=3):
+        vec = None
+        tag = ''
+        if probs is not None:
+            vec, tag = probs, ''
+        elif scores is not None:
+            vec, tag = scores, ' (scores)'
         else:
-            self._streak = 1
-            self._prev_pred = prediction_id
+            return ''
+        idx = np.argsort(vec)[::-1][:k]
+        items = []
+        for i in idx:
+            enc_cls = int(class_order[i]) if class_order is not None else i
+            name = self.le.inverse_transform([enc_cls])[0]
+            items.append(f'{name}={vec[i]:.2f}')
+        return ' | ' + ' '.join(items) + tag
 
-        if self._streak < self.consecutive_required:
+    def _mapped_key_for_label(self, label: str):
+        if label in self.gesture_to_key:
+            return self.gesture_to_key[label]
+        if label == 'left':
+            return self.gesture_to_key.get('wrist_left')
+        if label == 'right':
+            return self.gesture_to_key.get('wrist_right')
+        if label in ('open', 'openhand'):
+            return self.gesture_to_key.get('open_hand')
+        return None
+
+    def _maybe_send_key(self, label: str, probs, scores, class_order):
+        if not self.send_keys:
+            return
+        key = self._mapped_key_for_label(label)
+        if not key:
             return
 
-        if (now - self.last_trigger_ts) < self.cooldown_sec:
-            return
-
-        label = gesture_labels.get(prediction_id, f"unknown({prediction_id})")
-        if label == "fist":
-            self.get_logger().info("Action: SPACE (from 'fist')")
-            self._press_key(Key.space)
-            self.last_trigger_ts = now
-        elif label == "pinch":
-            self.get_logger().info("Action: ENTER (from 'pinch')")
-            self._press_key(Key.enter)
-            self.last_trigger_ts = now
-
-    # ---------------- ROS callback ----------------
-    def listener_callback(self, msg: Float32MultiArray):
-        # Expect per-sample EMG vector of length 8
-        if len(msg.data) != NUM_CHANNELS:
-            self.get_logger().warn(f"Unexpected EMG vector size: {len(msg.data)} (expected {NUM_CHANNELS})")
-            return
-
-        self.emg_buffer.append(list(msg.data))
-
-        if len(self.emg_buffer) < window_size:
-            return
-
-        # Prepare features
-        window_np = np.array(self.emg_buffer, dtype=np.float32)  # [T, 8]
-        feat = self._extract_features(window_np).reshape(1, -1)  # [1, F]
-
-        # Inference
-        try:
-            if self.pipeline is not None:
-                pred = int(self.pipeline.predict(feat)[0])
+        # optional confidence gate
+        if self.min_conf > 0.0:
+            passed = False
+            if probs is not None:
+                try:
+                    cls_index = int(self.le.transform([label])[0])
+                    passed = float(probs[cls_index]) >= self.min_conf
+                except Exception:
+                    passed = False
+            elif scores is not None and class_order is not None:
+                try:
+                    cls_index = int(self.le.transform([label])[0])
+                    # find where this class sits in class_order
+                    # class_order holds encoded class labels aligned to scores
+                    order_index = np.where(class_order == cls_index)[0]
+                    if len(order_index):
+                        passed = float(scores[order_index[0]]) >= self.min_conf
+                except Exception:
+                    passed = False
             else:
-                # scaler + model
-                feat_scaled = self.scaler.transform(feat) if self.scaler is not None else feat
-                pred = int(self.model.predict(feat_scaled)[0])
-        except Exception as e:
-            self.get_logger().error(f"Inference error: {e}")
+                passed = True  # no scores available; ignore gate
+            if not passed:
+                return
+
+        now = time.time()
+        if label != self._last_sent_label or (now - self._last_sent_time) >= self.min_interval:
+            ok = self._sender.send(key)
+            if ok:
+                self._last_sent_label = label
+                self._last_sent_time = now
+                self.get_logger().info(f'Sent key: {key} (for gesture: {label})')
+            else:
+                self.get_logger().warn(f'Failed to send key: {key}')
+
+    def cb(self, msg: MyoMsg):
+        # Myo has 8 EMG channels
+        if len(msg.emg_data) != 8:
             return
 
-        # Log and maybe act
-        label = gesture_labels.get(pred, f"id:{pred}")
-        self.get_logger().info(f"Predicted Gesture: {label}")
-        self._maybe_trigger_action(pred)
+        self.emg_buf.append(np.array(msg.emg_data, dtype=float))
+        if len(self.emg_buf) < self.W:
+            return
 
+        Xw = np.stack(self.emg_buf, axis=0)  # (W,8)
+        feats = self._features_train_exact(Xw).reshape(1, -1)
+
+        try:
+            y_pred, probs, scores, class_order = self._predict_with_scores(feats)
+        except Exception as e:
+            self.get_logger().error(f'Prediction failed: {e}')
+            return
+
+        try:
+            label = self.le.inverse_transform([int(y_pred)])[0]
+        except Exception:
+            label = str(y_pred)
+
+        # Majority vote smoothing
+        self.pred_buf.append(label)
+        voted = Counter(self.pred_buf).most_common(1)[0][0]
+
+        # Log + publish
+        self.get_logger().info(f'Pred: {label} -> voted: {voted}{self._topk_str(probs, scores, class_order)}')
+        self.pub_label.publish(String(data=voted))
+
+        # Send key on voted label (debounced)
+        self._maybe_send_key(voted, probs, scores, class_order)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = EMG_SVM_Node()
-    rclpy.spin(node)
+    node = EMGClassifierSVM()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     node.destroy_node()
     rclpy.shutdown()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

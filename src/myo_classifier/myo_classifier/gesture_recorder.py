@@ -17,8 +17,8 @@ class GestureRecorder(Node):
 
         # ---------- Parameters (YAML or CLI) ----------
         # gestures can be "fist, open_hand, thumbs_up" or ["fist","open_hand"]
-        self.declare_parameter('gestures', 'fist, open_hand, thumbs_up')
-        self.declare_parameter('seconds', 5)                 # per cycle
+        self.declare_parameter('gestures', 'rest, fist, open_hand, wrist_left, wrist_right')
+        self.declare_parameter('seconds', 8)                 # per cycle
         self.declare_parameter('cycles', 2)                  # repetitions per gesture
         self.declare_parameter('window_size', 200)           # samples for features
         self.declare_parameter('raw_mode', True)             # True=raw rows, False=features
